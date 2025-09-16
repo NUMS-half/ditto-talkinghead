@@ -36,3 +36,8 @@ log/*
 
 !example/audio.wav
 !example/image.png
+
+# train
+/scripts/archive_20250916
+/train/fine_tuned_checkpoints
+/train/*data
