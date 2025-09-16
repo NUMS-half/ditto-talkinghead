@@ -2,6 +2,7 @@ import os
 import sys
 import cv2
 import torch
+import wandb
 import librosa
 import numpy as np
 from tqdm.auto import tqdm
@@ -17,6 +18,10 @@ from core.atomic_components.wav2feat import Wav2Feat  # 音频处理器
 from core.models.modules.LMDM import LMDM as DittoLMDM  # ditto 原生的 LMDM 模型定义，并重命名以区分
 from core.models.modules.lmdm_modules.utils import extract  # 扩散过程需要的工具函数
 
+from utils import set_seed, get_logger
+
+LOG_DIR = "./log"
+logger = get_logger('AudioTrain', LOG_DIR)
 
 def collate_fn(batch):
     # 过滤掉数据集中返回的 None
@@ -50,13 +55,13 @@ class DittoDataset(Dataset):
         if os.path.exists(motion_mean_path) and os.path.exists(motion_std_path):
             self.motion_mean = torch.load(motion_mean_path)
             self.motion_std = torch.load(motion_std_path)
-            print("成功加载运动潜空间的均值和标准差。")
+            logger.info("Successful load mean and std of motion space.")
         else:
-            print("未找到均值/标准差文件，将使用 0/1 进行占位。")
+            logger.warning("Not found mean or std file, use 0/1 for placeholder.")
             self.motion_mean = torch.zeros(265)
             self.motion_std = torch.ones(265)
 
-        print(f"DittoDataset 初始化完成，共 {len(self.file_list)} 个数据片段。")
+        logger.info(f"DittoDataset initialize finished with {len(self.file_list)} data segments in total.")
 
     def __len__(self):
         return len(self.file_list)
@@ -70,7 +75,7 @@ class DittoDataset(Dataset):
         device = f"cuda:{gpu_id}"
         self.worker_device = device
 
-        print(f"Initializing models for worker {worker_id} on device {device}...")
+        logger.info(f"Initializing models for worker {worker_id} on device {device}...")
 
         # 在分配好的 GPU 上创建 MotionExtractor
         self.motion_extractor = MotionExtractor(num_kp=21, backbone="convnextv2_tiny").to(device)
@@ -99,7 +104,7 @@ class DittoDataset(Dataset):
             audio_features = torch.cat([hubert_1024, padding], dim=1)
         except Exception as e:
             # 音频处理失败
-            print(f"警告: 处理音频 {audio_path} 失败: {e}, 将跳过此样本。")
+            logger.warning(f"Handling audio {audio_path} failed with: {e}, this sample will be skipped.")
             return None
 
         # 视频处理
@@ -109,7 +114,7 @@ class DittoDataset(Dataset):
         cap.release()
 
         if not frames:
-            print(f"警告: 无法从 {video_path} 读取帧, 将跳过此样本。")
+            logger.warning(f"Cannot read frames from {video_path}, this sample will be skipped.")
             return None
 
         frames_np = np.array(frames) / 255.0
@@ -138,7 +143,7 @@ class DittoDataset(Dataset):
         # 对齐与裁剪
         min_len = min(len(audio_features), len(motion_latents))
         if min_len < self.seq_len:
-            print(f"警告: 样本 {base_name} 长度不足 ({min_len} < {self.seq_len}), 将跳过。")
+            logger.warning(f"The length of sample {base_name} is not long enough({min_len} < {self.seq_len}), it will be skipped.")
             return None
 
         start_idx = np.random.randint(0, min_len - self.seq_len + 1)
@@ -157,7 +162,7 @@ class DittoAudioMotionTrainer:
         # 2. 获取预训练模型的路径
         pretrained_path = self.config.get('pretrained_lmdm_path')
         if pretrained_path and os.path.exists(pretrained_path):
-            print(f"正在从 {pretrained_path} 加载预训练权重...")
+            logger.info(f"Loading pre-trained weights from {pretrained_path}...")
             try:
                 # 3. 加载权重文件
                 checkpoint = torch.load(pretrained_path, map_location=self.device)
@@ -172,11 +177,11 @@ class DittoAudioMotionTrainer:
 
                 # 5. 将权重载入模型
                 self.model.model.load_state_dict(state_dict)
-                print("预训练权重加载成功！模型已准备好进行微调。")
+                logger.info("Successfully loaded pre-trained weights, model is ready to fine tune.")
             except Exception as e:
-                print(f"加载预训练权重失败: {e}。将从头开始训练。")
+                logger.warning(f"Failed to load pre-trained weights with: {e}. The model will be trained from scratch.")
         else:
-            print("未提供或未找到预训练模型路径，将从头开始训练。")
+            logger.error("The path of the pre-trained model was not provided or found. The model will be trained from scratch.")
 
         self.optim = torch.optim.AdamW(self.model.parameters(), lr=config['learning_rate'],
                                        weight_decay=config['weight_decay'])
@@ -189,8 +194,8 @@ class DittoAudioMotionTrainer:
         """
         在训练开始前，评估一次预训练模型在当前数据集上的初始损失。
         """
-        print("\n" + "=" * 50)
-        print("开始评估预训练模型的初始损失...")
+        logger.info("\n" + "=" * 100)
+        logger.info("Starting to evaluate initial loss of the pre-trained model...")
 
         # 1. 准备数据集和数据加载器 (与训练时使用相同的配置)
         eval_dataset = DittoDataset(data_root=self.config['data_path'],
@@ -207,7 +212,7 @@ class DittoAudioMotionTrainer:
 
         # 2. 使用 torch.no_grad()，因为我们只评估，不计算梯度
         with torch.no_grad():
-            pbar = tqdm(eval_loader, desc="评估初始Loss")
+            pbar = tqdm(eval_loader, desc="Evaluating initial loss")
             for x_start, cond in pbar:
                 if x_start is None or cond is None:
                     continue
@@ -233,11 +238,13 @@ class DittoAudioMotionTrainer:
         # 4. 计算并打印平均损失
         if batch_count > 0:
             average_loss = total_loss / batch_count
-            print(f"预训练模型在你的数据集上的初始平均Loss为: {average_loss:.6f}")
+            logger.info(f"The initial average Loss of the pre-trained model on current dataset is: {average_loss:.6f}")
+            # 将初始 loss 记录到 wandb summary
+            wandb.summary["initial_loss"] = average_loss
         else:
-            print("未能计算初始Loss，可能是所有数据都无效。")
+            logger.warning("Cannot calculate the initial Loss, which might cause by all the data is invalid.")
 
-        print("=" * 50 + "\n")
+        print("=" * 100 + "\n")
 
     def train(self):
         # 将配置模板和路径传递给 Dataset
@@ -251,12 +258,15 @@ class DittoAudioMotionTrainer:
 
         # 数据缓存
         cached_data = []
-        print("首次运行，开始加载并缓存所有数据...")
+        logger.info("First run, start loading and caching data...")
         # 仅在第一个 epoch 加载数据并存入内存
         caching_pbar = tqdm(train_loader, desc="Caching data")  # 缓存进度
         for batch in caching_pbar:
             cached_data.append(batch)
-        print(f"数据缓存完成！共缓存 {len(cached_data)} 个批次。")
+        logger.info(f"Caching data finished. Cached {len(cached_data)} batches in total.")
+
+        # 使用 wandb.watch 监控模型梯度和参数
+        wandb.watch(self.model, log="all", log_freq=100)
 
         for epoch in range(1, self.config['epochs'] + 1):
             self.model.train()
@@ -312,12 +322,19 @@ class DittoAudioMotionTrainer:
             if valid_losses:
                 avg_epoch_loss = np.mean(valid_losses)
                 if epoch % 10 == 0 or epoch == self.config['epochs']:
-                    print(f"Epoch {epoch} 完成. 平均 Loss: {avg_epoch_loss:.6f}")
+                    logger.info(f"Epoch {epoch} finished with Avg Loss: {avg_epoch_loss:.6f}")
+
+                # 记录 epoch loss 到 wandb
+                wandb.log({"epoch": epoch, "avg_epoch_loss": avg_epoch_loss})
 
                 # 检查当前 epoch 的 loss 是否是最低
                 if avg_epoch_loss < self.best_loss:
                     self.best_loss = avg_epoch_loss
-                    print(f"发现新的最低损失 {self.best_loss:.6f}，保存最佳模型...")
+                    logger.info(f"Find the lowest loss {self.best_loss:.6f}, saving the best model...")
+
+                    # 更新 wandb summary 中的 best_loss
+                    wandb.summary["best_loss"] = self.best_loss
+                    wandb.summary["best_loss_epoch"] = epoch
 
                     os.makedirs(self.config['save_dir'], exist_ok=True)
                     # 使用固定的文件名来保存最佳模型，这样会覆盖上一个最佳模型
@@ -331,12 +348,13 @@ class DittoAudioMotionTrainer:
                         "loss": self.best_loss
                     }
                     torch.save(checkpoint_to_save, save_path)
-                    print(f"最佳模型已保存至 {save_path}")
+                    logger.info(f"The best model has been saved to {save_path}.")
             else:
-                print(f"Epoch {epoch} 完成. 所有批次的 Loss 均为无效值 (NaN/inf)。")
+                logger.warning(f"Epoch {epoch} finished. the loss of all batched are invalid (NaN/inf).")
 
-        print(f"微调训练完成，最佳模型已保存(loss={self.best_loss})")
-
+        logger.info(f"Fine tuning finished, the best model has been saved (loss={self.best_loss}).")
+        # 标记 wandb 运行结束
+        wandb.finish()
 
 
 if __name__ == '__main__':
@@ -352,6 +370,21 @@ if __name__ == '__main__':
         "weight_decay": 0.0001,
         "num_workers": 4,
     }
+
+    # 设置随机种子
+    seed = 42
+    set_seed(seed)
+    logger.info(f"Random seed has been set to {seed}.")
+
+    # 初始化 wandb
+    wandb.init(
+        project="ditto-talkinghead-finetune",
+        entity=None,
+        mode="offline",
+        config=training_config  # 将训练配置上传到 wandb
+    )
+    # logger.info(f"Wandb initialized. Project: {args.wandb_project}, Entity: {args.wandb_entity}")
+
     trainer = DittoAudioMotionTrainer(training_config)
     trainer.evaluate_initial_loss()
     trainer.train()
