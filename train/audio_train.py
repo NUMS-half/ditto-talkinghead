@@ -21,7 +21,7 @@ from core.models.modules.lmdm_modules.utils import extract  # 扩散过程需要
 from utils import set_seed, get_logger
 
 LOG_DIR = "./log"
-logger = get_logger('AudioTrain', LOG_DIR)
+logger = get_logger('audio_train', LOG_DIR)
 
 def collate_fn(batch):
     # 过滤掉数据集中返回的 None

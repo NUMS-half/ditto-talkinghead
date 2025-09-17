@@ -18,7 +18,7 @@ MIN_SEGMENT_DURATION_SECONDS = 3.2  # 80帧 / 25fps = 3.2秒
 
 # 日志
 LOG_DIR = "./log"
-logger = get_logger('DataProcess', LOG_DIR)
+logger = get_logger('data_process', LOG_DIR)
 
 
 def find_speech_segments_from_audio(video_path):
